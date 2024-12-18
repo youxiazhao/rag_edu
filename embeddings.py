@@ -1,12 +1,13 @@
 import os
 import json
-from abc import ABC, abstractmethod
-from typing import List, Dict, Any
+# from abc import ABC, abstractmethod
+# from typing import List, Dict, Any
+from typing import List
 from uuid import uuid4
-from datetime import datetime
-import argparse
-import tiktoken
-from tiktoken import get_encoding
+# from datetime import datetime
+# import argparse
+# import tiktoken
+# from tiktoken import get_encoding
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings, AzureOpenAIEmbeddings
 from langchain_community.embeddings import JinaEmbeddings
@@ -32,13 +33,27 @@ class EmbeddingManager:
 
 
 class JSONLoader:
-    def load_documents(self, file_dir: str, test: bool = False) -> List[Document]:
+    def load_documents(self, file_path: str, test: bool = False, test_limit: int = 5) -> List[Document]:
         documents = []
         count = 0
         if test:
             print("Running in test mode")
-            test_file= os.path.join(file_dir, sorted(os.listdir(file_dir))[0])
-            with open(test_file, "r", encoding="utf-8") as f:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if count >= test_limit:
+                        break
+                    item = json.loads(line.strip())
+                    metadata = {
+                        "source": item['id'],
+                        "chapter": item["chapter"],
+                        "section": item["section"],
+                        "subsection": item["subsection"]
+                    }
+                    documents.append(Document(page_content=item["content"], metadata=metadata))
+                    # print(documents)
+                    count += 1
+        else:
+            with open(file_path, "r", encoding="utf-8") as f:
                 for line in f:
                     item = json.loads(line.strip())
                     metadata = {
@@ -48,55 +63,14 @@ class JSONLoader:
                         "subsection": item["subsection"]
                     }
                     documents.append(Document(page_content=item["content"], metadata=metadata))
-                    print(documents)
-        else:
-            for file in sorted(os.listdir(file_dir)):
-                if file.endswith(".jsonl"):
-                    file_path = os.path.join(file_dir, file)
-                    if file_path == "./corpus/jina_chunk/20_普通动物学_4_200.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/38_Lewin基因_12_432.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/进化生物学基础_4_8.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/33_动物行为学_2_115.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/33_动物行为学_2_115_1.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/行为生态学_2_195.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/分子细胞生物学_3_102.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/37_遗传学_从基因到基因组_6_316.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/分子细胞生物学_3_263.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/15_38.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/38_Lewin基因_12_377.jsonl":
-                        continue
-                    if file_path == "./corpus/jina_chunk/23_植物生理学_8_100.jsonl":
-                        continue
-
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            item = json.loads(line.strip())
-                        metadata = {
-                            "source": item['id'],
-                            "chapter": item["chapter"],
-                            "section": item["section"],
-                            "subsection": item["subsection"]
-                        }
-                        
-
-                        documents.append(Document(page_content=item["content"], metadata=metadata))
-                        count += 1
-                        print(count)
-                        print(f"Loaded {len(documents)} documents")
-                        print(file_path)
-                        print(item["id"])
-                        print(item["content"])
+                    count += 1
+                    print(count)
+                    print(f"Loaded {len(documents)} documents")
+                    print(file_path)
+                    print(item["id"])
+                    print(item["content"])
         return documents
+    
 
 
 class EmbeddingPipeline:
@@ -137,49 +111,47 @@ class EmbeddingPipeline:
         elif self.embedding_type == "jina":
             self.embeddings =JinaEmbeddings(model_name="jina-embeddings-v2-base-en", jina_api_key=os.getenv("GINA_API_KEY"))
 
-        elif self.embedding_type == "sentence_transformer":
-            self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        # elif self.embedding_type == "sentence_transformer":
+        #     self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         
         else:
             raise ValueError("Unsupported embedding type")
 
 
 
-    def embed_documents(self, file_dir: str, test: bool = False):
+    def embed_documents(self, file_dir: str, test: bool = False, batch_size: int = 2000):
         loader = JSONLoader()
-        documents = loader.load_documents(file_dir, test=test)
-        manager = EmbeddingManager(
-            vector_store=self.vector_store,
-            embedding_model=self.embeddings
-        )
-        num_docs = manager.load_and_embed_documents(documents)
-        print(f"{self.db_type.capitalize()}_{self.embedding_type.capitalize()}: Embedded {num_docs} documents from {file_dir}")
+        files = sorted(os.listdir(file_dir))
+
+        if test:
+            # Limit to processing only the first file in test mode
+            files = files[:1]
+
+        for file in files:
+            if file.endswith(".jsonl"):
+                file_path = os.path.join(file_dir, file)
+                documents = loader.load_documents(file_path, test=test)
+                
+                # Process documents in batches
+                for i in range(0, len(documents), batch_size):
+                    batch = documents[i:i + batch_size]
+                    manager = EmbeddingManager(
+                        vector_store=self.vector_store,
+                        embedding_model=self.embeddings
+                    )
+                    num_docs = manager.load_and_embed_documents(batch)
+                    print(f"{self.db_type.capitalize()}_{self.embedding_type.capitalize()}: Embedded {num_docs} documents from {file_path} (Batch {i // batch_size + 1})")
 
 
-
-# if __name__ == "__main__":
-#     parser = argparse.ArgumentParser(description='Document Loader')
-#     parser.add_argument('--db_type', type=str, choices=['chroma', 'pgvector'], required=True, help='Database type')
-#     parser.add_argument('--embedding_type', type=str, choices=['openai', 'azure_openai', 'jina', 'sentence_transformer'], required=True, help='Embedding type')
-#     parser.add_argument('--db_path', type=str, default='./db', help='Database path for Chroma')
-#     parser.add_argument('--file_path', type=str, required=True, help='Path to the document file')
-#     args = parser.parse_args()
-
-
-#     pipeline = EmbeddingPipeline(
-#         db_type=args.db_type,
-#         db_path=args.db_path,
-#         embedding_type=args.embedding_type
-#     )
-#     pipeline.embed_documents(args.file_path)
 
 if __name__ == "__main__":
-    file_dir = "./corpus/jina_chunk"  # Replace with your file directory
-    embedding_type = "jina"  # Choose from ['openai', 'azure_openai', 'jina', 'sentence_transformer']
+    file_dir = "./corpus/chunk"  # Replace with your file directory
+    embedding_type = "openai"  # Choose from ['openai', 'azure_openai', 'jina',]
     db_type = "chroma"  # Choose from ['chroma', 'pgvector']
+    batch_size = 2000  # Set your desired batch size
 
     pipeline = EmbeddingPipeline(
         db_type=db_type,
         embedding_type=embedding_type
     )
-    pipeline.embed_documents(file_dir, test=False)
+    pipeline.embed_documents(file_dir, test=True, batch_size=batch_size)

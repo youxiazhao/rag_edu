@@ -4,7 +4,7 @@ import re
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from transformers import BertTokenizer
 
-file_dir = "/home/youxia/.ssh/rag_edu/final_json"
+
 
 
 def concat(title, content):
@@ -13,12 +13,13 @@ def concat(title, content):
 
 if __name__ == "__main__":
     file_dir = "/home/youxia/.ssh/rag_edu/final_json"
-    output_dir = "corpus/jina_chunk"
+    output_dir = "corpus/chunk"
+
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
     for file in os.listdir(file_dir):
@@ -34,18 +35,18 @@ if __name__ == "__main__":
                 texts = text_splitter.split_text(content.strip())
 
 
-                try:
-                    for segment in text_splitter.split_text(content):
-                        while len(tokenizer.tokenize(segment)) > 2048:
-                            sub_segments = text_splitter.split_text(segment)
-                            if len(sub_segments) <= 1:
-                                raise ValueError(f"Segment too long after splitting: {len(segment)} tokens.")
-                            texts.extend(sub_segments[:-1])
-                            segment = sub_segments[-1]
-                        texts.append(segment)
-                except ValueError as e:
-                    print(f"Error processing segment in file {file}, line {line_index}: {e}")
-                    continue
+                # try:
+                #     for segment in text_splitter.split_text(content):
+                #         while len(tokenizer.tokenize(segment)) > 2048:
+                #             sub_segments = text_splitter.split_text(segment)
+                #             if len(sub_segments) <= 1:
+                #                 raise ValueError(f"Segment too long after splitting: {len(segment)} tokens.")
+                #             texts.extend(sub_segments[:-1])
+                #             segment = sub_segments[-1]
+                #         texts.append(segment)
+                # except ValueError as e:
+                #     print(f"Error processing segment in file {file}, line {line_index}: {e}")
+                #     continue
 
 
 

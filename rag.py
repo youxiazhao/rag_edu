@@ -1,116 +1,205 @@
 import os
 from typing import List, Tuple
+from collections import defaultdict
+from dataclasses import dataclass
 from langchain_openai import OpenAIEmbeddings, AzureOpenAIEmbeddings
-from langchain_jina import JinaEmbeddings
+from langchain_community.embeddings import JinaEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_chroma import Chroma
+from langchain_postgres import PGVector
 from langchain_postgres.vectorstores import PGVector
 # from sentence_transformers import SentenceTransformer
-from langchain_core.documents import Document
+import time
 
-class RetrieverPipeline:
-    def __init__(self, db_type="chroma", embedding_type="openai"):
+from dotenv import load_dotenv
+load_dotenv()
+
+
+@dataclass
+class SearchResult:
+    answer_text: str
+    references: str
+
+class RAGProcessor:
+    def __init__(self, db_type="chroma", embedding_type="openai", pg_config=None):
         self.db_type = db_type
         self.embedding_type = embedding_type
-        self._initialize_embeddings()
-
-        # 初始化数据库连接
-        if db_type == "chroma":
-            collection_name = f"{embedding_type}_chroma_collection"
-            db_path = f"./corpus/vector_store/{embedding_type}/chroma_db"
-            self.vector_store = Chroma(
-                collection_name=collection_name,
-                embedding_function=self.embeddings,
-                persist_directory=db_path,
-            )
-        elif db_type == "pgvector":
-            connection =  "postgresql+psycopg://langchain:langchain@localhost:6024/langchain" # TODO: change to your own db
-            collection_name = f"{embedding_type}_pgvector_collection"
-            db_path = f"./corpus/vector_store/{embedding_type}/pgvector_db"
-            self.vector_store = PGVector(
-                embeddings=self.embeddings,
-                collection_name=collection_name,
-                connection=connection,
-                use_jsonb=True,
-            )
-        else:
-            raise ValueError("Unsupported database type")
+        self.embeddings = self._initialize_embeddings()
+        self.vector_store = self._initialize_vector_store(pg_config)
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
     def _initialize_embeddings(self):
         if self.embedding_type == "openai":
             # text-embedding-3-large
-            self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=os.getenv("OPENAI_API_KEY"))
+            return OpenAIEmbeddings(model="text-embedding-3-small", api_key=os.getenv("OPENAI_API_KEY"))
         
         elif self.embedding_type == "azure_openai":
             api_key = os.getenv("AZURE_API_KEY")
             azure_endpoint = os.getenv("AZURE_ENDPOINT")
             azure_api_version = os.getenv("OPENAI_API_VERSION")
-            self.embeddings = AzureOpenAIEmbeddings(model="text-embedding-3-large", api_version=azure_api_version, azure_endpoint=azure_endpoint, api_key=api_key)
+            return AzureOpenAIEmbeddings(model="text-embedding-3-large", api_version=azure_api_version, azure_endpoint=azure_endpoint, api_key=api_key)
 
         elif self.embedding_type == "jina":
-            self.embeddings =JinaEmbeddings(model_name="jina-embeddings-v2-base-en", jina_api_key=os.getenv("GINA_API_KEY"))
+            return JinaEmbeddings(model_name="jina-embeddings-v2-base-en", jina_api_key=os.getenv("GINA_API_KEY"))
 
-        elif self.embedding_type == "sentence_transformer":
-            self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        
+        # elif self.embedding_type == "sentence_transformer":
+        #     return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         else:
             raise ValueError("Unsupported embedding type")
         
 
-    def retrieve_documents(self, query: str, k: int = 5) -> List[Tuple[str, float]]:
-        """
-        执行检索并返回结果。
-
-        Args:
-            query (str): 查询文本
-            k (int): 返回最相关的文档数量
-
-        Returns:
-            List[Tuple[str, float]]: 文档内容和对应的分数
-        """
-        print(f"正在使用 {self.db_type} 数据库和 {self.embedding_type} 模型进行检索...")
+    def _initialize_vector_store(self, pg_config):
         if self.db_type == "chroma":
-            results = self.vector_store.similarity_search_with_score(query, k=k)
+            return Chroma(
+                collection_name=f"{self.embedding_type}_chroma_collection",
+                embedding_function=self.embeddings,
+                persist_directory=f"./corpus/vector_store/{self.embedding_type}/chroma_db"
+            )
         elif self.db_type == "pgvector":
-            query_embedding = self.embeddings.embed_query(query)
-            results = self.vector_store.similarity_search(query_embedding, k=k)
+            if not pg_config:
+                raise ValueError("pg_config is required for pgvector")
+            connection = f"postgresql+psycopg://{pg_config['user']}:{pg_config['password']}@{pg_config['host']}:{pg_config['port']}/{pg_config['dbname']}"
+            return PGVector(
+                embeddings=self.embeddings,
+                collection_name=f"{self.embedding_type}_pgvector_collection",
+                connection=connection,
+                use_jsonb=True
+            )
         else:
             raise ValueError("Unsupported database type")
 
-        for doc in results:
-            print(f"* {doc.page_content} [{doc.metadata}]")
 
-        formatted_results = [(doc.page_content, score) for doc, score in results]
-        return formatted_results
+    def process_query(self, query: str) -> SearchResult:
+        results = self.vector_store.similarity_search_with_relevance_scores(query, k=3)
+    
+        # Process the results to generate the answer
+        merged_metadata, page_contents_string = self.process_textbook_results(results)
+        answer = self._generate_answer(query, page_contents_string)
+        
+        # Format the references
+        formatted_references = self.format_references(merged_metadata)
+        
+        return SearchResult(answer_text=answer, references=formatted_references)
 
-# Example usage
+
+    def process_textbook_results(self, results: List[Tuple]) -> Tuple[dict, str]:
+        merged_metadata = defaultdict(lambda: {"sections": defaultdict(set)})
+        page_contents_string = ""
+        
+        for res, score in results:
+            page_content = res.page_content
+            chapter = res.metadata.get("chapter")
+            section = res.metadata.get("section")
+            subsection = res.metadata.get("subsection")
+            
+            page_contents_string += (
+                f"章节: {chapter}\n"
+                f"节: {section}\n"
+                f"小节: {subsection}\n"
+                f"{page_content}\n\n"
+            )
+            
+            if chapter and section:
+                merged_metadata[chapter]["sections"][section].add(subsection)
+        
+        return dict(merged_metadata), page_contents_string
+
+
+    def _generate_answer(self, query: str, page_contents_string: str) -> str:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "你是一位专业的课程答疑助手。请根据提供的课本内容，用中文markdown格式为学生解答问题。\n\n"
+                    "回答要求：\n"
+                    "1. 回答长度控制在300-800字\n"
+                    "2. 语言要专业准确，符合大学本科的学术水平\n"
+                    "3. 可以引用课本内容，但要用自己的语言重新组织表达\n"
+                    "4. 忽略课本文字中出现的\"图xx-xx\"的引用，因为这些原书图片无法获取\n"
+                    "5. 回答要有逻辑性和连贯性，避免简单罗列知识点\n"
+                    "6. 如果问题涉及多个方面，要分点回答，确保全面性\n"
+                ),
+                ("human", "问题: {query}\n\n课本参考内容: {page_contents_string}"),
+            ]
+        )
+
+        chain = prompt | self.llm
+        output =chain.invoke(
+            {
+                "query": query,
+                "page_contents_string": page_contents_string,
+            }
+        )
+
+        return output.content
+
+        # prompt_template = f"""
+        # 你是一位专业的课程答疑助手。请根据提供的课本内容，用中文markdown格式为学生解答问题。
+
+        # 回答要求：
+        # 1. 回答长度控制在300-800字
+        # 2. 语言要专业准确，符合大学本科的学术水平
+        # 3. 可以引用课本内容，但要用自己的语言重新组织表达
+        # 4. 忽略课本文字中出现的"图xx-xx"的引用，因为这些原书图片无法获取
+        # 5. 回答要有逻辑性和连贯性，避免简单罗列知识点
+        # 6. 如果问题涉及多个方面，要分点回答，确保全面性
+
+        # 问题: {query}
+
+        # 课本参考内容: {page_contents_string}
+        # """
+
+        # completion = self.client.chat.completions.create(
+        #     model="gpt-4o-mini",
+        #     messages=[
+        #         {"role": "user", "content": prompt_template}
+        #     ]
+        # )
+        
+        # return completion.choices[0].message.content
+
+
+    def format_references(self, references: dict) -> str:
+        formatted_str = ""
+        for chapter, chapter_data in references.items():
+            formatted_str += f"章节：{chapter}\n"
+            for section_key, sections in chapter_data.items():
+                if section_key == "sections":
+                    for section, subsections in sections.items():
+                        formatted_str += f"  └─ {section}\n"
+                        for subsection in subsections:
+                            if subsection:  # 只有当subsection不为空时才添加
+                                formatted_str += f"      └─ {subsection}\n"
+        return formatted_str
+
+
 if __name__ == "__main__":
-    # 配置参数
-    db_type = "chroma"  # 选择 'chroma' 或 'pgvector'
-    embedding_type = "openai"  # 选择 'openai', 'azure_openai', 或 'sentence_transformer'
-    collection_name = "retrieval_collection"
-    db_path = "./corpus/vector_store/chroma_db"  # Chroma 的路径
+    db_type = "chroma"  # Choose from ['chroma', 'pgvector']
+    embedding_type = "openai"  # Choose from ['openai', 'azure_openai', 'jina',]
     pg_config = {
         "dbname": "mydatabase",
         "user": "myuser",
         "password": "mypassword",
         "host": "localhost",
-    }
+        "port": 5432,
+    } # TODO: change to your own pg_config
 
-    # 初始化检索器
-    retriever = RetrieverPipeline(
+    processor = RAGProcessor(
         db_type=db_type,
-        collection_name=collection_name,
-        db_path=db_path,
+        embedding_type=embedding_type,
         pg_config=pg_config if db_type == "pgvector" else None,
-        embedding_type=embedding_type
     )
 
-    # 执行检索
-    query = "细胞膜的结构"  # 示例查询
-    results = retriever.retrieve_documents(query, k=5)
+    test_query = "细胞膜的结构"
+    print("问题:", test_query)
 
-    # 打印结果
-    print("\n检索结果：")
-    for idx, (content, score) in enumerate(results, start=1):
-        print(f"结果 {idx} (分数: {score:.4f}):\n{content}\n")
+    start_time = time.time()
+    result = processor.process_query(test_query)
+    end_time = time.time()
+    
+    print("回答:", result.answer_text)
+    print("\n参考内容:")
+    print(result.references)
 
+    print(f"处理耗时: {end_time - start_time:.2f} 秒")
