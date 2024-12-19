@@ -20,67 +20,48 @@ load_dotenv()
 class SearchResult:
     answer_text: str
     references: str
+    image_references: str
 
 class RAGProcessor:
-    def __init__(self, db_type="chroma", embedding_type="openai", pg_config=None):
-        self.db_type = db_type
-        self.embedding_type = embedding_type
-        self.embeddings = self._initialize_embeddings()
-        self.vector_store = self._initialize_vector_store(pg_config)
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-    def _initialize_embeddings(self):
-        if self.embedding_type == "openai":
-            # text-embedding-3-large
-            return OpenAIEmbeddings(model="text-embedding-3-small", api_key=os.getenv("OPENAI_API_KEY"))
-        
-        elif self.embedding_type == "azure_openai":
-            api_key = os.getenv("AZURE_API_KEY")
-            azure_endpoint = os.getenv("AZURE_ENDPOINT")
-            azure_api_version = os.getenv("OPENAI_API_VERSION")
-            return AzureOpenAIEmbeddings(model="text-embedding-3-large", api_version=azure_api_version, azure_endpoint=azure_endpoint, api_key=api_key)
-
-        elif self.embedding_type == "jina":
-            return JinaEmbeddings(model_name="jina-embeddings-v2-base-en", jina_api_key=os.getenv("GINA_API_KEY"))
-
-        # elif self.embedding_type == "sentence_transformer":
-        #     return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        else:
-            raise ValueError("Unsupported embedding type")
-        
-
-    def _initialize_vector_store(self, pg_config):
-        if self.db_type == "chroma":
-            return Chroma(
-                collection_name=f"{self.embedding_type}_chroma_collection",
-                embedding_function=self.embeddings,
-                persist_directory=f"./corpus/vector_store/{self.embedding_type}/chroma_db"
-            )
-        elif self.db_type == "pgvector":
-            if not pg_config:
-                raise ValueError("pg_config is required for pgvector")
-            connection = f"postgresql+psycopg://{pg_config['user']}:{pg_config['password']}@{pg_config['host']}:{pg_config['port']}/{pg_config['dbname']}"
-            return PGVector(
+    def __init__(self, pg_config=None):
+        self.embeddings = JinaEmbeddings(model_name="jina-embeddings-v3", jina_api_key=os.getenv("GINA_API_KEY"))
+        connection = f"postgresql+psycopg://{pg_config['user']}:{pg_config['password']}@{pg_config['host']}:{pg_config['port']}/{pg_config['dbname']}"
+        self.text_vector_store = PGVector(
                 embeddings=self.embeddings,
-                collection_name=f"{self.embedding_type}_pgvector_collection",
+                collection_name="rag_text_embeddings",
                 connection=connection,
                 use_jsonb=True
             )
-        else:
-            raise ValueError("Unsupported database type")
+        self.image_vector_store = PGVector(
+                embeddings=self.embeddings,
+                collection_name="rag_image_embeddings",
+                connection=connection,
+                use_jsonb=True
+            )
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 
     def process_query(self, query: str) -> SearchResult:
-        results = self.vector_store.similarity_search_with_relevance_scores(query, k=3)
+        # Perform similarity search for text
+        text_results = self.text_vector_store.similarity_search_with_relevance_scores(query, k=5)
+        print(text_results)
+        # Perform similarity search for images
+        image_results = self.image_vector_store.similarity_search_with_relevance_scores(query, k=3)
+        print(image_results)
     
-        # Process the results to generate the answer
-        merged_metadata, page_contents_string = self.process_textbook_results(results)
-        answer = self._generate_answer(query, page_contents_string)
+        # Process the text results
+        merged_metadata, page_contents_string = self.process_textbook_results(text_results)
+        
+        # Process the image results
+        image_references = self.process_image_results(image_results)
+        
+        # Generate the answer using both text and image content
+        answer = self._generate_answer(query, page_contents_string, image_references)
         
         # Format the references
         formatted_references = self.format_references(merged_metadata)
         
-        return SearchResult(answer_text=answer, references=formatted_references)
+        return SearchResult(answer_text=answer, references=formatted_references, image_references=image_references)
 
 
     def process_textbook_results(self, results: List[Tuple]) -> Tuple[dict, str]:
@@ -89,24 +70,42 @@ class RAGProcessor:
         
         for res, score in results:
             page_content = res.page_content
+            book_title = res.metadata.get("book")
             chapter = res.metadata.get("chapter")
             section = res.metadata.get("section")
             subsection = res.metadata.get("subsection")
             
             page_contents_string += (
+                f"书名: {book_title}\n"
                 f"章节: {chapter}\n"
                 f"节: {section}\n"
                 f"小节: {subsection}\n"
                 f"{page_content}\n\n"
             )
-            
             if chapter and section:
                 merged_metadata[chapter]["sections"][section].add(subsection)
+                merged_metadata[chapter]["book_title"] = book_title  # Add book title to metadata
+
+            # if chapter and section:
+            #     merged_metadata[chapter]["sections"][section].add(subsection)
         
         return dict(merged_metadata), page_contents_string
 
+    def process_image_results(self, results: List[Tuple]) -> str:
+        base_url = "https://edurag.oss-cn-beijing.aliyuncs.com/images/"
+        image_references = ""
+        for res, score in results:
+            book_title = res.metadata.get("book")
+            image_path = res.metadata.get("image_path")
+            full_image_url = f"{base_url}{image_path}"
 
-    def _generate_answer(self, query: str, page_contents_string: str) -> str:
+            image_references += (
+                f"书名: {book_title}\n\n",
+                f"图片链接: {full_image_url}\n"
+            )
+        return image_references
+
+    def _generate_answer(self, query: str, page_contents_string: str, image_references: str) -> str:
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -120,7 +119,7 @@ class RAGProcessor:
                     "5. 回答要有逻辑性和连贯性，避免简单罗列知识点\n"
                     "6. 如果问题涉及多个方面，要分点回答，确保全面性\n"
                 ),
-                ("human", "问题: {query}\n\n课本参考内容: {page_contents_string}"),
+                ("human", "问题: {query}\n\n课本参考内容: {page_contents_string}\n\n图片参考内容: {image_references}"),
             ]
         )
 
@@ -129,66 +128,40 @@ class RAGProcessor:
             {
                 "query": query,
                 "page_contents_string": page_contents_string,
+                "image_references": image_references,
             }
         )
 
         return output.content
 
-        # prompt_template = f"""
-        # 你是一位专业的课程答疑助手。请根据提供的课本内容，用中文markdown格式为学生解答问题。
-
-        # 回答要求：
-        # 1. 回答长度控制在300-800字
-        # 2. 语言要专业准确，符合大学本科的学术水平
-        # 3. 可以引用课本内容，但要用自己的语言重新组织表达
-        # 4. 忽略课本文字中出现的"图xx-xx"的引用，因为这些原书图片无法获取
-        # 5. 回答要有逻辑性和连贯性，避免简单罗列知识点
-        # 6. 如果问题涉及多个方面，要分点回答，确保全面性
-
-        # 问题: {query}
-
-        # 课本参考内容: {page_contents_string}
-        # """
-
-        # completion = self.client.chat.completions.create(
-        #     model="gpt-4o-mini",
-        #     messages=[
-        #         {"role": "user", "content": prompt_template}
-        #     ]
-        # )
-        
-        # return completion.choices[0].message.content
-
 
     def format_references(self, references: dict) -> str:
         formatted_str = ""
         for chapter, chapter_data in references.items():
-            formatted_str += f"章节：{chapter}\n"
+            book_title = chapter_data.get("book_title", "Unknown Title")  # Retrieve the book title
+            formatted_str += f"书名：{book_title}\n"  # Add the book title at the beginning
+            # formatted_str += f"章节：{chapter}\n"
             for section_key, sections in chapter_data.items():
                 if section_key == "sections":
                     for section, subsections in sections.items():
                         formatted_str += f"  └─ {section}\n"
-                        for subsection in subsections:
-                            if subsection:  # 只有当subsection不为空时才添加
-                                formatted_str += f"      └─ {subsection}\n"
+                        # for subsection in subsections:
+                        #     if subsection:  # 只有当subsection不为空时才添加
+                        #         formatted_str += f"      └─ {subsection}\n"
         return formatted_str
 
 
 if __name__ == "__main__":
-    db_type = "chroma"  # Choose from ['chroma', 'pgvector']
-    embedding_type = "openai"  # Choose from ['openai', 'azure_openai', 'jina',]
     pg_config = {
-        "dbname": "mydatabase",
-        "user": "myuser",
-        "password": "mypassword",
+        "dbname": "rag_db",
+        "user": "edurag_user",
+        "password": "edurag_pass",
         "host": "localhost",
         "port": 5432,
     } # TODO: change to your own pg_config
 
     processor = RAGProcessor(
-        db_type=db_type,
-        embedding_type=embedding_type,
-        pg_config=pg_config if db_type == "pgvector" else None,
+        pg_config=pg_config,
     )
 
     test_query = "细胞膜的结构"
@@ -201,5 +174,7 @@ if __name__ == "__main__":
     print("回答:", result.answer_text)
     print("\n参考内容:")
     print(result.references)
+    print("\n参考图片:")
+    print(result.image_references)
 
     print(f"处理耗时: {end_time - start_time:.2f} 秒")

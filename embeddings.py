@@ -1,157 +1,180 @@
+from langchain_community.embeddings import JinaEmbeddings
+from transformers import AutoModel
+
+
+from langchain_core.documents import Document
+import psycopg2
 import os
 import json
-# from abc import ABC, abstractmethod
-# from typing import List, Dict, Any
 from typing import List
 from uuid import uuid4
-# from datetime import datetime
-# import argparse
-# import tiktoken
-# from tiktoken import get_encoding
-from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings, AzureOpenAIEmbeddings
-from langchain_community.embeddings import JinaEmbeddings
-# from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-from langchain_postgres import PGVector
-from langchain_postgres.vectorstores import PGVector
-# from sentence_transformers import SentenceTransformer
-
 from dotenv import load_dotenv
+import time
 
 load_dotenv()
 
-class EmbeddingManager:
-    def __init__(self, vector_store, embedding_model):
-        self.vector_store = vector_store
-        self.embedding_model = embedding_model
-
-    def load_and_embed_documents(self, documents: List[Document]):
-        uuids = [str(uuid4()) for _ in range(len(documents))]
-        self.vector_store.add_documents(documents=documents, ids=uuids)
-        return len(documents)
-
-
 class JSONLoader:
-    def load_documents(self, file_path: str, test: bool = False, test_limit: int = 5) -> List[Document]:
+    def load_documents(self, file_path: str, doc_type: str = "text", test: bool = False, test_limit: int = 5) -> List[Document]:
         documents = []
         count = 0
-        if test:
-            print("Running in test mode")
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if count >= test_limit:
-                        break
-                    item = json.loads(line.strip())
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if test and count >= test_limit:
+                    break
+                item = json.loads(line.strip())
+                
+                if doc_type == "text":
                     metadata = {
-                        "source": item['id'],
-                        "chapter": item["chapter"],
-                        "section": item["section"],
-                        "subsection": item["subsection"]
+                        "book": item.get("book"),
+                        "chapter": item.get("chapter"),
+                        "section": item.get("section"),
+                        "subsection": item.get("subsection")
                     }
-                    documents.append(Document(page_content=item["content"], metadata=metadata))
-                    # print(documents)
-                    count += 1
-        else:
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    item = json.loads(line.strip())
+                    content = item["content"]
+                elif doc_type == "image":
                     metadata = {
-                        "source": item['id'],
-                        "chapter": item["chapter"],
-                        "section": item["section"],
-                        "subsection": item["subsection"]
+                        "book": item.get("book"),
+                        "image_path": item.get("image_path")
                     }
-                    documents.append(Document(page_content=item["content"], metadata=metadata))
-                    count += 1
-                    print(count)
-                    print(f"Loaded {len(documents)} documents")
-                    print(file_path)
-                    print(item["id"])
-                    print(item["content"])
-        return documents
-    
+                    content = item["description"]  # Assuming image data is stored in this key
 
+                documents.append(Document(page_content=content, metadata=metadata))
+                count += 1
+        print(f"Loaded {len(documents)} documents from {file_path}")
+        return documents
 
 class EmbeddingPipeline:
-    def __init__(self, db_type="chroma", embedding_type="openai"):
-        self.db_type = db_type
-        self.embedding_type = embedding_type
-        self._initialize_embeddings()
-        if db_type == "chroma":
-            collection_name = f"{embedding_type}_chroma_collection"
-            db_path = f"./corpus/vector_store/{embedding_type}/chroma_db"
-            self.vector_store = Chroma(
-                collection_name=collection_name,
-                embedding_function=self.embeddings,
-                persist_directory=db_path,
+    def __init__(self):
+        try:
+            self.embeddings = JinaEmbeddings(model_name="jina-embeddings-v3", jina_api_key=os.getenv("JINA_API_KEY"))
+            self.conn = psycopg2.connect(
+                dbname="rag_db",
+                user="edurag_user",
+                password="edurag_pass",
+                host="localhost",
+                port="5432"
             )
-        elif db_type == "pgvector":
-            connection = "postgresql+psycopg://langchain:langchain@localhost:6024/langchain" # TODO: change to your own db
-            collection_name = f"{embedding_type}_pgvector_collection"
-            db_path = f"./corpus/vector_store/{embedding_type}/pgvector_db"
-            self.vector_store = PGVector(
-                embeddings=self.embeddings,
-                collection_name=collection_name,
-                connection=connection,
-                use_jsonb=True,
+            self.cur = self.conn.cursor() 
+        except Exception as e:
+            print(f"Initialization error: {e}")
+            self.cur = None 
+        
+        self.processed_files_path = "corpus/processed_files.json"
+        self.processed_files = self.load_processed_files()
+
+    def load_processed_files(self):
+        if os.path.exists(self.processed_files_path):
+            with open(self.processed_files_path, "r") as f:
+                return set(json.load(f))
+        return set()
+    
+    def save_processed_file(self, file_path):
+        self.processed_files.add(file_path)
+        with open(self.processed_files_path, "w") as f:
+            json.dump(list(self.processed_files), f)
+
+    def get_table_name(self, doc_type: str) -> str:
+        # Define a mapping from document type to table name
+        table_name_mapping = {
+            "text": "rag_text_embeddings",
+            "image": "rag_image_embeddings"
+            # Add more mappings if there are other document types
+        }
+        return table_name_mapping.get(doc_type, "default_table_name")
+
+
+    def create_table_if_not_exists(self, doc_type: str):
+        if not self.cur:
+            print("Database cursor is not initialized.")
+            return
+        table_name = self.get_table_name(doc_type)
+        try:
+            self.cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                document_id VARCHAR(255) UNIQUE NOT NULL,
+                book_title VARCHAR(255),
+                embedding VECTOR(1024),
+                embedding_type VARCHAR(50) NOT NULL,
+                metadata JSONB
             )
+            """)
+            self.conn.commit()
+        except Exception as e:
+            print(f"Error creating table {table_name}: {e}")
 
-    def _initialize_embeddings(self):
-        if self.embedding_type == "openai":
-            # text-embedding-3-large
-            self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=os.getenv("OPENAI_API_KEY"))
+    def load_and_embed_documents(self, documents: List[Document], doc_type: str):
+        if not self.cur:
+            print("Database cursor is not initialized.")
+            return
+        table_name = self.get_table_name(doc_type)
+        self.create_table_if_not_exists(doc_type)
+        uuids = [str(uuid4()) for _ in documents]
+        document_contents = [doc.page_content for doc in documents]
+        embeddings = self.embeddings.embed_documents(document_contents)
         
-        elif self.embedding_type == "azure_openai":
-            api_key = os.getenv("AZURE_API_KEY")
-            azure_endpoint = os.getenv("AZURE_ENDPOINT")
-            azure_api_version = os.getenv("OPENAI_API_VERSION")
-            self.embeddings = AzureOpenAIEmbeddings(model="text-embedding-3-large", api_version=azure_api_version, azure_endpoint=azure_endpoint, api_key=api_key)
+        for document, embedding, uuid in zip(documents, embeddings, uuids):
+            document_id = uuid
+            book_title = document.metadata.get("book")
+            metadata_json = json.dumps(document.metadata)  # Convert metadata to JSON string
+  
+            try:
+                self.cur.execute(f"""
+                    INSERT INTO {table_name} (document_id, book_title, embedding, embedding_type, metadata)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (document_id) DO NOTHING
+                """, (document_id, book_title, embedding, doc_type, metadata_json))
+            except Exception as e:
+                print(f"Error inserting document {book_title} into table {table_name}: {e}")
 
-        elif self.embedding_type == "jina":
-            self.embeddings =JinaEmbeddings(model_name="jina-embeddings-v2-base-en", jina_api_key=os.getenv("GINA_API_KEY"))
+        self.conn.commit()
+        print("Transaction committed.")
 
-        # elif self.embedding_type == "sentence_transformer":
-        #     self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        
-        else:
-            raise ValueError("Unsupported embedding type")
-
-
-
-    def embed_documents(self, file_dir: str, test: bool = False, batch_size: int = 2000):
+    
+    def embedding_pipeline(self, file_dir: str, doc_type: str = "text", test: bool = False, batch_size: int = 500):
+        print(f"Embedding pipeline started for {file_dir} with {doc_type} documents")
         loader = JSONLoader()
-        files = sorted(os.listdir(file_dir))
+        count = 0
 
-        if test:
-            # Limit to processing only the first file in test mode
-            files = files[:1]
+        for file in os.listdir(file_dir):
+            file_path = os.path.join(file_dir, file)
+            
+            for doc in os.listdir(file_path):
+                count += 1
+                if test and count >= 5:
+                    break
 
-        for file in files:
-            if file.endswith(".jsonl"):
-                file_path = os.path.join(file_dir, file)
-                documents = loader.load_documents(file_path, test=test)
+                all_documents = []
+                if doc.endswith(".jsonl"):
+                    doc_path = os.path.join(file_path, doc)
+                    if doc_path in self.processed_files:
+                        print(f"Skipping already processed file: {doc_path}")
+                        continue
+                    try:
+                        documents = loader.load_documents(doc_path, doc_type=doc_type, test=test)
+                        all_documents.extend(documents)
+                    except Exception as e:
+                        print(f"Error loading documents from {doc_path}: {e}")
+                        continue
+
+                for i in range(0, len(all_documents), batch_size):
+                    batch = all_documents[i:i + batch_size]
+                    self.load_and_embed_documents(batch, doc_type)
                 
-                # Process documents in batches
-                for i in range(0, len(documents), batch_size):
-                    batch = documents[i:i + batch_size]
-                    manager = EmbeddingManager(
-                        vector_store=self.vector_store,
-                        embedding_model=self.embeddings
-                    )
-                    num_docs = manager.load_and_embed_documents(batch)
-                    print(f"{self.db_type.capitalize()}_{self.embedding_type.capitalize()}: Embedded {num_docs} documents from {file_path} (Batch {i // batch_size + 1})")
-
-
+                # Mark this file as processed
+                self.save_processed_file(doc_path)
 
 if __name__ == "__main__":
-    file_dir = "./corpus/chunk"  # Replace with your file directory
-    embedding_type = "openai"  # Choose from ['openai', 'azure_openai', 'jina',]
-    db_type = "chroma"  # Choose from ['chroma', 'pgvector']
-    batch_size = 2000  # Set your desired batch size
+    # Initialize the embedding pipeline
+    pipeline = EmbeddingPipeline()
+    
+    # text
+    file_directory = "./corpus/text_chunk"
+    pipeline.embedding_pipeline(file_dir=file_directory, doc_type="text", test=False, batch_size=500)
 
-    pipeline = EmbeddingPipeline(
-        db_type=db_type,
-        embedding_type=embedding_type
-    )
-    pipeline.embed_documents(file_dir, test=True, batch_size=batch_size)
+    # image
+    # file_directory = "./corpus/image_chunk"
+    # pipeline.embedding_pipeline(file_dir=file_directory, doc_type="image", test=False, batch_size=500)
+    
+    # Close database connection
+    pipeline.cur.close()
+    pipeline.conn.close()
