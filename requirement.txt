@@ -6,3 +6,7 @@ langchain-postgres==0.0.12
 fastapi==0.115.6
 numpy==1.26.4
 requests==2.32.3
+psycopg2-binary
+python-dotenv
+jieba==0.42.1
+chromadb==0.5.23
