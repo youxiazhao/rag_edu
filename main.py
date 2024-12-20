@@ -16,8 +16,13 @@ def connect_to_db(pg_config):
         return None
 
 
+def load_book_lists(file_path):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        data = json.load(file)
+    return data['core_book_list'], data['supplementary_book_list']
 
-def main(pg_config, query, book_list, table_name):
+
+def main(pg_config, query, book_list, retrieve_text=True, retrieve_images=True):
     # Initialize the RAGProcessor
     processor = RAGProcessor()
 
@@ -26,7 +31,7 @@ def main(pg_config, query, book_list, table_name):
 
     if conn:
         # Call the process_query function
-        result = processor.process_query(query, conn, table_name, book_list)
+        result = processor.process_query(query, conn, book_list, retrieve_text=retrieve_text, retrieve_images=retrieve_images)
 
         # Print the results
         print("回答:", result.answer_text)
@@ -50,14 +55,12 @@ if __name__ == "__main__":
     } # TODO: change to your own pg_config
 
     query = "描述细胞膜的结构及其在细胞功能中的作用。"
-    book_list = [
-        '29_基础生态学_4_', '6_细胞生物学_5_', '生物信息学_Bioinformatics_and_Functional_Genomics_中文版',
-        '23_植物生理学_8_', 'Developmental_Biologyｨ9ｩ', '杨荣武生物化学原理_3_', '20_普通动物学_4_',
-        '7_Molecular_Biology_of_The_Cellｨ7ｩ', 'Human_Physiology_An_Integrated_Approachｨ8ｩ',
-    ]
+    core_book_list, supplementary_book_list = load_book_lists('booklist.json')
 
-    # image
-    table_name = "rag_text_embeddings"
-    table_name = "rag_image_embeddings"
 
-    main(pg_config, query, book_list, table_name)
+
+    # retrive all
+    book_list = core_book_list + supplementary_book_list
+    main(pg_config, query, book_list, retrieve_text=True, retrieve_images=True)
+
+   

@@ -21,9 +21,9 @@ load_dotenv()
 
 @dataclass
 class SearchResult:
-    answer_text: str
-    references: str
-    image_references: str
+    answer_text: str = ""
+    references: str = ""
+    image_references: str = ""
 
 class RAGProcessor:
     def __init__(self, pg_config=None):
@@ -45,6 +45,8 @@ class RAGProcessor:
         return embeddings, metadata
 
     def calculate_cosine_similarity(self, query_embedding, embeddings):
+        print("Query Embedding Shape:", query_embedding.shape)
+        print("Embeddings Shape:", embeddings.shape)
         query_norm = np.linalg.norm(query_embedding)
         query_embedding_normalized = query_embedding / query_norm if query_norm != 0 else query_embedding
 
@@ -128,9 +130,10 @@ class RAGProcessor:
             [
                 (
                     "system",
-                    "你是一位专业的检索助手。请根据用户的查询，分析哪些书中的内容可以帮助回答问题，并返回选定的书单。\n\n"
+                    "你是一位专业的检索助手。请根据用户的查询，分析列表中哪些书中的内容可以帮助回答问题，并返回选定的书单。\n\n"
                     "回答要求：\n"
-                    "1. 不要改动任何书名\n"
+                    "1. 只从给定的list中选择书的名字,不用考虑其格式是否是书名 \n"
+                    "2. 不要改动任何书名\n"
                     "2. 不要超过5本书\n"
                     "3. 书单中不要出现重复的书名\n"
                 ),
@@ -174,33 +177,56 @@ class RAGProcessor:
     
 
 
-    def process_query(self, query: str, conn, table_name: str, book_list: List[str], k=5) -> SearchResult:
+    def process_query(self, query: str, conn, book_list: List[str], k=5, retrieve_text=True, retrieve_images=True) -> SearchResult:
         # Step 1: Suggest book titles
         suggested_books = self.suggest_book_title(query, book_list)
         print("Suggested Books:", suggested_books)  # Debugging output
 
-        # Step 2: Retrieve embeddings for the suggested books
-        embeddings, metadata = self.get_selected_embeddings(conn, table_name, suggested_books)
-        print("Embeddings Retrieved:", len(embeddings))  # Debugging output
+        if retrieve_text:
+            # Step 2: Retrieve embeddings for the suggested books
+            embeddings_text, metadata_text = self.get_selected_embeddings(conn, "rag_text_embeddings", suggested_books)
+            print("Embeddings Retrieved:", len(embeddings_text))  # Debugging output
+            
+            # Step 3: Calculate similarity
+            query_embedding = self.embeddings.embed_query(query)
+            similarities = self.calculate_cosine_similarity(query_embedding, embeddings_text)
 
-        # Step 3: Calculate similarity
-        query_embedding = self.embeddings.embed_query(query)
-        similarities = self.calculate_cosine_similarity(query_embedding, embeddings)
-        print("Similarities Calculated:", similarities)  # Debugging output
+             # Step 4: Rank results
+            top_k_indices = np.argsort(similarities)[-k:][::-1]
+            top_k_results = [(metadata_text[i], similarities[i]) for i in top_k_indices]
+            print("Top K Results:", top_k_results)  # Debugging output
 
-        # Step 4: Rank results
-        top_k_indices = np.argsort(similarities)[-k:][::-1]
-        top_k_results = [(metadata[i], similarities[i]) for i in top_k_indices]
-        print("Top K Results:", top_k_results)  # Debugging output
+            # Step 5: Process results
+            merged_metadata, page_contents_string = self.process_textbook_results(top_k_results)
 
-        # Step 5: Generate final answer
-        merged_metadata, page_contents_string = self.process_textbook_results(top_k_results)
-        image_references = self.process_image_results(top_k_results)
-        answer_text = self._generate_answer(query, page_contents_string, image_references)
+            text_references = self.format_references(merged_metadata)    
+            print(text_references)
+
+
+        if retrieve_images:
+            embeddings_image, metadata_image = self.get_selected_embeddings(conn, "rag_image_embeddings", suggested_books)
+            print("Embeddings Retrieved:", len(embeddings_image))  # Debugging output
+
+            # Step 3: Calculate similarity
+            query_embedding = self.embeddings.embed_query(query)
+            similarities = self.calculate_cosine_similarity(query_embedding, embeddings_image)
+            print("Similarities Calculated:", similarities)  # Debugging output
+
+            # Step 4: Rank results
+            top_k_indices = np.argsort(similarities)[-k:][::-1]
+            top_k_results = [(metadata_image[i], similarities[i]) for i in top_k_indices]
+            print("Top K Results:", top_k_results)  # Debugging output
+
+            # Step 5: Process results
+            image_references = self.process_image_results(top_k_results)
+            
+
+        answer_text = self._generate_answer(query, page_contents_string=page_contents_string if retrieve_text else "", image_references=image_references if retrieve_images else "")
         print("Generated Answer:", answer_text)  # Debugging output
 
-        references = self.format_references(merged_metadata)    
-        print(references)
 
-        return SearchResult(answer_text=answer_text, references=references, image_references=image_references)
+        if not embeddings_text and not embeddings_image:
+            return print("没有设置相关内容retrieval")
+        
+        return SearchResult(answer_text=answer_text, references=text_references, image_references=image_references)
 
