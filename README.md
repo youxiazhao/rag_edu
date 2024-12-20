@@ -140,5 +140,6 @@ main函数下面，已设置好, 可以直接跑
 2. rag.py 中列出了核心的process过程，可以调整llm和prompt, receive书的个数，retrieve document top k的个数，answer及reference的格式，
 TODO：image url 需要调整
 
-4. main.py 中列出了run的入口，可以设置pg_config, query, book_list, table_name（文本/图片）
+
+3. main.py 中列出了run的入口，可以设置pg_config, query, book_list, retrieve_text和retrieve_images选择
 
