@@ -90,7 +90,7 @@ psql --version
 
 3. Enable the extension in the database:
    ```bash
-   psql -U postgres -d edurag_db
+   psql -U postgres -d rag_db
    CREATE EXTENSION IF NOT EXISTS vector;
    \q
    ```
