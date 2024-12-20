@@ -11,7 +11,10 @@ from langchain_postgres import PGVector
 from langchain_postgres.vectorstores import PGVector
 # from sentence_transformers import SentenceTransformer
 import time
+import numpy as np
+import json
 
+import psycopg2
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -25,55 +28,57 @@ class SearchResult:
 class RAGProcessor:
     def __init__(self, pg_config=None):
         self.embeddings = JinaEmbeddings(model_name="jina-embeddings-v3", jina_api_key=os.getenv("GINA_API_KEY"))
-        connection = f"postgresql+psycopg://{pg_config['user']}:{pg_config['password']}@{pg_config['host']}:{pg_config['port']}/{pg_config['dbname']}"
-        self.text_vector_store = PGVector(
-                embeddings=self.embeddings,
-                collection_name="rag_text_embeddings",
-                connection=connection,
-                use_jsonb=True
-            )
-        self.image_vector_store = PGVector(
-                embeddings=self.embeddings,
-                collection_name="rag_image_embeddings",
-                connection=connection,
-                use_jsonb=True
-            )
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
+    def get_selected_embeddings(self, conn, table_name, placeholders):
+        embeddings = []  # Initialize the list before the loop
+        metadata = []    # Initialize the list before the loop
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT book_title, embedding, metadata FROM {table_name}")  # Assuming 'id' is the document ID
+            rows = cur.fetchall()
+            for row in rows:
+                book_title, embedding_str, metadata_json = row
+                if book_title in placeholders:
+                    embedding = np.array(json.loads(embedding_str))
+                    embeddings.append(embedding)  # Convert to numpy array if needed
+                    metadata.append(metadata_json)
+        return embeddings, metadata
 
-    def process_query(self, query: str) -> SearchResult:
-        # Perform similarity search for text
-        text_results = self.text_vector_store.similarity_search_with_relevance_scores(query, k=5)
-        print(text_results)
-        # Perform similarity search for images
-        image_results = self.image_vector_store.similarity_search_with_relevance_scores(query, k=3)
-        print(image_results)
-    
-        # Process the text results
-        merged_metadata, page_contents_string = self.process_textbook_results(text_results)
-        
-        # Process the image results
-        image_references = self.process_image_results(image_results)
-        
-        # Generate the answer using both text and image content
-        answer = self._generate_answer(query, page_contents_string, image_references)
-        
-        # Format the references
-        formatted_references = self.format_references(merged_metadata)
-        
-        return SearchResult(answer_text=answer, references=formatted_references, image_references=image_references)
+    def calculate_cosine_similarity(self, query_embedding, embeddings):
+        query_norm = np.linalg.norm(query_embedding)
+        query_embedding_normalized = query_embedding / query_norm if query_norm != 0 else query_embedding
 
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings_normalized = np.divide(embeddings, norms, where=norms != 0)
+
+        cosine_similarities = np.dot(embeddings_normalized, query_embedding_normalized)
+        return cosine_similarities
+
+    def search_similar_embeddings_pgvector(self, query: str, conn, table_name: str, k=5):
+        query_embedding = self.embeddings.embed_query(query)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT book_title, embedding <-> %s AS distance
+                FROM {table_name}
+                ORDER BY distance ASC
+                LIMIT %s
+            """,
+            (query_embedding.tolist(), k)
+            )
+            results = cur.fetchall()
+        return [(row[0], row[1]) for row in results]
 
     def process_textbook_results(self, results: List[Tuple]) -> Tuple[dict, str]:
         merged_metadata = defaultdict(lambda: {"sections": defaultdict(set)})
         page_contents_string = ""
-        
+    
         for res, score in results:
-            page_content = res.page_content
-            book_title = res.metadata.get("book")
-            chapter = res.metadata.get("chapter")
-            section = res.metadata.get("section")
-            subsection = res.metadata.get("subsection")
+            page_content = res.get("page_content", "")
+            book_title = res.get("metadata", {}).get("book", "")
+            chapter = res.get("metadata", {}).get("chapter", "")
+            section = res.get("metadata", {}).get("section", "")
+            subsection = res.get("metadata", {}).get("subsection", "")
             
             page_contents_string += (
                 f"书名: {book_title}\n"
@@ -84,26 +89,59 @@ class RAGProcessor:
             )
             if chapter and section:
                 merged_metadata[chapter]["sections"][section].add(subsection)
-                merged_metadata[chapter]["book_title"] = book_title  # Add book title to metadata
+                merged_metadata[chapter]["book_title"] = book_title
 
-            # if chapter and section:
-            #     merged_metadata[chapter]["sections"][section].add(subsection)
+            return dict(merged_metadata), page_contents_string
         
-        return dict(merged_metadata), page_contents_string
+    def format_references(self, references: dict) -> str:
+        formatted_str = ""
+        for chapter, chapter_data in references.items():
+            book_title = chapter_data.get("book_title", "Unknown Title")  # Retrieve the book title
+            formatted_str += f"书名：{book_title}\n"  # Add the book title at the beginning
+            # formatted_str += f"章节：{chapter}\n"
+            for section_key, sections in chapter_data.items():
+                if section_key == "sections":
+                    for section, subsections in sections.items():
+                        formatted_str += f"  └─ {section}\n"
+                        # for subsection in subsections:
+                        #     if subsection:  # 只有当subsection不为空时才添加
+                        #         formatted_str += f"      └─ {subsection}\n"
+        return formatted_str
 
     def process_image_results(self, results: List[Tuple]) -> str:
-        base_url = "https://edurag.oss-cn-beijing.aliyuncs.com/images/"
+        base_url = "https://edurag.oss-cn-beijing.aliyuncs.com/images/" # TODO: change to your own oss url
         image_references = ""
         for res, score in results:
-            book_title = res.metadata.get("book")
-            image_path = res.metadata.get("image_path")
+            book_title = res.get("metadata", {}).get("book", "")
+            image_path = res.get("metadata", {}).get("image_path", "")
             full_image_url = f"{base_url}{image_path}"
 
             image_references += (
-                f"书名: {book_title}\n\n",
-                f"图片链接: {full_image_url}\n"
+                f"书名: {book_title}\n"
+                f"图片链接: {full_image_url}\n\n"
             )
         return image_references
+    
+
+    def suggest_book_title(self, query: str, book_list: List[str]) -> str:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "你是一位专业的检索助手。请根据用户的查询，分析哪些书中的内容可以帮助回答问题，并返回选定的书单。\n\n"
+                    "回答要求：\n"
+                    "1. 不要改动任何书名\n"
+                    "2. 不要超过5本书\n"
+                    "3. 书单中不要出现重复的书名\n"
+                ),
+                ("human", "问题: {query}\n\n书单: {book_list}"),
+            ]
+        )
+        chain = prompt | self.llm
+        output = chain.invoke(
+            {"query": query, "book_list": book_list}
+        )
+        return output.content
 
     def _generate_answer(self, query: str, page_contents_string: str, image_references: str) -> str:
         prompt = ChatPromptTemplate.from_messages(
@@ -133,48 +171,36 @@ class RAGProcessor:
         )
 
         return output.content
-
-
-    def format_references(self, references: dict) -> str:
-        formatted_str = ""
-        for chapter, chapter_data in references.items():
-            book_title = chapter_data.get("book_title", "Unknown Title")  # Retrieve the book title
-            formatted_str += f"书名：{book_title}\n"  # Add the book title at the beginning
-            # formatted_str += f"章节：{chapter}\n"
-            for section_key, sections in chapter_data.items():
-                if section_key == "sections":
-                    for section, subsections in sections.items():
-                        formatted_str += f"  └─ {section}\n"
-                        # for subsection in subsections:
-                        #     if subsection:  # 只有当subsection不为空时才添加
-                        #         formatted_str += f"      └─ {subsection}\n"
-        return formatted_str
-
-
-if __name__ == "__main__":
-    pg_config = {
-        "dbname": "rag_db",
-        "user": "edurag_user",
-        "password": "edurag_pass",
-        "host": "localhost",
-        "port": 5432,
-    } # TODO: change to your own pg_config
-
-    processor = RAGProcessor(
-        pg_config=pg_config,
-    )
-
-    test_query = "细胞膜的结构"
-    print("问题:", test_query)
-
-    start_time = time.time()
-    result = processor.process_query(test_query)
-    end_time = time.time()
     
-    print("回答:", result.answer_text)
-    print("\n参考内容:")
-    print(result.references)
-    print("\n参考图片:")
-    print(result.image_references)
 
-    print(f"处理耗时: {end_time - start_time:.2f} 秒")
+
+    def process_query(self, query: str, conn, table_name: str, book_list: List[str], k=5) -> SearchResult:
+        # Step 1: Suggest book titles
+        suggested_books = self.suggest_book_title(query, book_list)
+        print("Suggested Books:", suggested_books)  # Debugging output
+
+        # Step 2: Retrieve embeddings for the suggested books
+        embeddings, metadata = self.get_selected_embeddings(conn, table_name, suggested_books)
+        print("Embeddings Retrieved:", len(embeddings))  # Debugging output
+
+        # Step 3: Calculate similarity
+        query_embedding = self.embeddings.embed_query(query)
+        similarities = self.calculate_cosine_similarity(query_embedding, embeddings)
+        print("Similarities Calculated:", similarities)  # Debugging output
+
+        # Step 4: Rank results
+        top_k_indices = np.argsort(similarities)[-k:][::-1]
+        top_k_results = [(metadata[i], similarities[i]) for i in top_k_indices]
+        print("Top K Results:", top_k_results)  # Debugging output
+
+        # Step 5: Generate final answer
+        merged_metadata, page_contents_string = self.process_textbook_results(top_k_results)
+        image_references = self.process_image_results(top_k_results)
+        answer_text = self._generate_answer(query, page_contents_string, image_references)
+        print("Generated Answer:", answer_text)  # Debugging output
+
+        references = self.format_references(merged_metadata)    
+        print(references)
+
+        return SearchResult(answer_text=answer_text, references=references, image_references=image_references)
+
