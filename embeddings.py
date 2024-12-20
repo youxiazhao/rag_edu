@@ -14,34 +14,42 @@ import time
 load_dotenv()
 
 class JSONLoader:
-    def load_documents(self, file_path: str, doc_type: str = "text", test: bool = False, test_limit: int = 5) -> List[Document]:
+    def load_documents(self, file_path: str, doc_format: str = "text", test: bool = False, test_limit: int = 5) -> list[Document]:
         documents = []
         count = 0
         with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if test and count >= test_limit:
-                    break
-                item = json.loads(line.strip())
-                
-                if doc_type == "text":
-                    metadata = {
-                        "book": item.get("book"),
-                        "chapter": item.get("chapter"),
-                        "section": item.get("section"),
-                        "subsection": item.get("subsection")
-                    }
-                    content = item["content"]
-                elif doc_type == "image":
-                    metadata = {
-                        "book": item.get("book"),
-                        "image_path": item.get("image_path")
-                    }
-                    content = item["description"]  # Assuming image data is stored in this key
+            try:
+                data = json.load(f)  # Load the entire file as a JSON array
+                if doc_format == "text":
+                     for item in data:
+                        if test and count >= test_limit:
+                            break
+                        metadata = {
+                            "book": os.path.splitext(file_path)[0],
+                            "chapter": item.get("Chapter"),
+                            "section": item.get("Section"),
+                            "subsection": item.get("Subsection")
+                        }
+                        content = item.get("Content", "")  # Use get to provide a default value
+                elif doc_format == "image":
+                    for key, item in data.items():
+                        if test and count >= test_limit:
+                            break
+                        metadata = {
+                            "book": os.path.splitext(file_path)[0],
+                            "image_path": key
+                        }
+                        content = item  # Use get to provide a default value
+                else:
+                    print(f"Unknown document type: {doc_format}")
 
                 documents.append(Document(page_content=content, metadata=metadata))
                 count += 1
+            except json.JSONDecodeError as e:
+                print(f"Error decoding JSON from file: {file_path} - {e}")
         print(f"Loaded {len(documents)} documents from {file_path}")
         return documents
+
 
 class EmbeddingPipeline:
     def __init__(self):
@@ -73,28 +81,27 @@ class EmbeddingPipeline:
         with open(self.processed_files_path, "w") as f:
             json.dump(list(self.processed_files), f)
 
-    def get_table_name(self, doc_type: str) -> str:
+    def get_table_name(self, doc_format: str) -> str:
         # Define a mapping from document type to table name
         table_name_mapping = {
             "text": "rag_text_embeddings",
             "image": "rag_image_embeddings"
             # Add more mappings if there are other document types
         }
-        return table_name_mapping.get(doc_type, "default_table_name")
+        return table_name_mapping.get(doc_format, "default_table_name")
 
 
-    def create_table_if_not_exists(self, doc_type: str):
+    def create_table_if_not_exists(self, doc_format: str):
         if not self.cur:
             print("Database cursor is not initialized.")
             return
-        table_name = self.get_table_name(doc_type)
+        table_name = self.get_table_name(doc_format)
         try:
             self.cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {table_name} (
-                document_id VARCHAR(255) UNIQUE NOT NULL,
                 book_title VARCHAR(255),
                 embedding VECTOR(1024),
-                embedding_type VARCHAR(50) NOT NULL,
+                doc_type VARCHAR(50) NOT NULL,
                 metadata JSONB
             )
             """)
@@ -102,27 +109,27 @@ class EmbeddingPipeline:
         except Exception as e:
             print(f"Error creating table {table_name}: {e}")
 
-    def load_and_embed_documents(self, documents: List[Document], doc_type: str):
+    def load_and_embed_documents(self, documents: List[Document], doc_format: str, doc_type: str):
         if not self.cur:
             print("Database cursor is not initialized.")
             return
-        table_name = self.get_table_name(doc_type)
-        self.create_table_if_not_exists(doc_type)
-        uuids = [str(uuid4()) for _ in documents]
+        table_name = self.get_table_name(doc_format)
+        # table_name = 'test'
+        self.create_table_if_not_exists(doc_format)
+
         document_contents = [doc.page_content for doc in documents]
         embeddings = self.embeddings.embed_documents(document_contents)
         
-        for document, embedding, uuid in zip(documents, embeddings, uuids):
-            document_id = uuid
+        for document, embedding in zip(documents, embeddings):
             book_title = document.metadata.get("book")
             metadata_json = json.dumps(document.metadata)  # Convert metadata to JSON string
   
             try:
                 self.cur.execute(f"""
-                    INSERT INTO {table_name} (document_id, book_title, embedding, embedding_type, metadata)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (document_id) DO NOTHING
-                """, (document_id, book_title, embedding, doc_type, metadata_json))
+                    INSERT INTO {table_name} (book_title, embedding, doc_type, metadata)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (book_title) DO NOTHING
+                """, (book_title, embedding, doc_type, metadata_json))
             except Exception as e:
                 print(f"Error inserting document {book_title} into table {table_name}: {e}")
 
@@ -130,36 +137,28 @@ class EmbeddingPipeline:
         print("Transaction committed.")
 
     
-    def embedding_pipeline(self, file_dir: str, doc_type: str = "text", test: bool = False, batch_size: int = 500):
-        print(f"Embedding pipeline started for {file_dir} with {doc_type} documents")
+    def embedding_pipeline(self, file_dir: str, doc_format: str = "text", doc_type: str = "core", test: bool = False, batch_size: int = 500):
+        print(f"Embedding pipeline started for {file_dir} with {doc_format} documents")
         loader = JSONLoader()
         count = 0
 
         for file in os.listdir(file_dir):
-            file_path = os.path.join(file_dir, file)
-            
-            for doc in os.listdir(file_path):
                 count += 1
                 if test and count >= 5:
                     break
-
+                doc_path = os.path.join(file_dir, file)
+                if doc_path in self.processed_files:
+                    print(f"Skipping already processed file: {doc_path}")
+                    continue
                 all_documents = []
-                if doc.endswith(".jsonl"):
-                    doc_path = os.path.join(file_path, doc)
-                    if doc_path in self.processed_files:
-                        print(f"Skipping already processed file: {doc_path}")
-                        continue
-                    try:
-                        documents = loader.load_documents(doc_path, doc_type=doc_type, test=test)
-                        all_documents.extend(documents)
-                    except Exception as e:
-                        print(f"Error loading documents from {doc_path}: {e}")
-                        continue
+                if doc_path.endswith(".json"):
+                    documents = loader.load_documents(doc_path, doc_format=doc_format, test=test)
+                    all_documents.extend(documents)
 
                 for i in range(0, len(all_documents), batch_size):
                     batch = all_documents[i:i + batch_size]
-                    self.load_and_embed_documents(batch, doc_type)
-                
+                    self.load_and_embed_documents(batch, doc_format, doc_type)
+                    
                 # Mark this file as processed
                 self.save_processed_file(doc_path)
 
@@ -167,13 +166,24 @@ if __name__ == "__main__":
     # Initialize the embedding pipeline
     pipeline = EmbeddingPipeline()
     
-    # text
-    file_directory = "./corpus/text_chunk"
-    pipeline.embedding_pipeline(file_dir=file_directory, doc_type="text", test=False, batch_size=500)
+    # core text
+    file_directory = "Textbook_Rag_Resouces/核心书库/课本"
+    pipeline.embedding_pipeline(file_dir=file_directory, doc_format="text", doc_type="core", test=False, batch_size=500)
 
-    # image
-    # file_directory = "./corpus/image_chunk"
-    # pipeline.embedding_pipeline(file_dir=file_directory, doc_type="image", test=False, batch_size=500)
+    # supplementary text
+    file_directory = "Textbook_Rag_Resouces/补充书库/课本"
+    pipeline.embedding_pipeline(file_dir=file_directory, doc_format="text", doc_type="supplementary", test=False, batch_size=500)
+
+
+    # core image
+    file_directory = "Textbook_Rag_Resouces/核心书库/图片"
+    pipeline.embedding_pipeline(file_dir=file_directory, doc_format="image", doc_type="core", test=False, batch_size=500)
+
+    # supplementary image
+    file_directory = "Textbook_Rag_Resouces/补充书库/图片"
+    pipeline.embedding_pipeline(file_dir=file_directory, doc_format="image", doc_type="supplementary", test=False, batch_size=500)
+
+
     
     # Close database connection
     pipeline.cur.close()

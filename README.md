@@ -69,7 +69,7 @@ psql --version
 2. Create a database and user:
 
    ```sql
-   CREATE DATABASE edurag_db;
+   CREATE DATABASE rag_db;
    CREATE USER edurag_user WITH PASSWORD 'edurag_pass';
    GRANT ALL PRIVILEGES ON DATABASE edurag_db TO edurag_user;
    ```
@@ -117,23 +117,27 @@ JINA_API_KEY
 
 # 各模块功能
 
-1. data_chunk.py 中列出了数据处理的方法，可以调整chunk size和overlap size
-
-2. embeddings.py 中列出了embeddings存储到pgvector的方法，可以调整embeddings的模型，数据库的存储设置，存储时的batch size等
+1. embeddings.py 中列出了embeddings存储到pgvector的方法，可以调整数据库的存储设置，存储时的batch size等
 
 ```
 self.cur.execute(f"""
    CREATE TABLE IF NOT EXISTS {table_name} (
-      document_id VARCHAR(255) UNIQUE NOT NULL,
-      book_title VARCHAR(255),
-      embedding VECTOR(1024),
-      embedding_type VARCHAR(50) NOT NULL,
-      metadata JSONB
+      CREATE TABLE IF NOT EXISTS {table_name} (
+         book_title VARCHAR(255),
+         embedding VECTOR(1024),
+         doc_type VARCHAR(50) NOT NULL,
+         metadata JSONB
       )
 """)
 ```
 
-3. rag.py 中列出了核心的process过程，可以调整llm和prompt, receive书的个数，retrieve document top k的个数，answer及reference的格式，
+- table_name 已根据text和image设置好
+- doc_type core 和 supplementary 已设置好
+
+main函数下面，已设置好, 可以直接跑
+
+
+2. rag.py 中列出了核心的process过程，可以调整llm和prompt, receive书的个数，retrieve document top k的个数，answer及reference的格式，
 TODO：image url 需要调整
 
 4. main.py 中列出了run的入口，可以设置pg_config, query, book_list, table_name（文本/图片）
